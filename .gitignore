@@ -1,0 +1,82 @@
+# Environment variables and API keys
+*.env
+.env
+.env.local
+.env.production
+.env.staging
+.env.development
+
+# OpenAI API keys and secrets
+openai_api_key.txt
+api_keys.txt
+secrets.txt
+
+# Python cache and build files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Translation project specific files
+batch_output.jsonl
+batch_errors.jsonl
+batch_requests_backup.jsonl
+debug_*.txt
+translations_backup.csv
+
+# Temporary and log files
+*.log
+*.tmp
+temp/
+logs/
+.pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
