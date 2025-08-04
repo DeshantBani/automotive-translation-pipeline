@@ -73,7 +73,7 @@ def create_jsonl_from_csv(csv_filename, jsonl_filename, target_language):
     current_batch = []
     current_tokens = system_prompt_tokens
 
-    for idx, (description_id, sentence) in enumerate(data_rows):
+    for (description_id, sentence) in enumerate(data_rows):
         line = f"{description_id}. {sentence}"
         line_tokens = count_tokens(line + "\n", encoding)
         est_output_tokens = int(line_tokens * EXPECTED_OUTPUT_FACTOR)
