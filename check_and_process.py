@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -20,28 +21,206 @@ if not os.getenv("OPENAI_API_KEY"):
         "Set your OPENAI_API_KEY environment variable before running.")
 
 
-def load_original_data(csv_path, batch_size):
+def load_original_data(csv_path):
     """Load original data with description_id mapping."""
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.reader(f)
         next(reader)  # Skip header row
-
-        # Store both description_id and sentence
         data_rows = []
         for row in reader:
             if len(row) > 1 and row[1].strip():
                 description_id = row[0].strip()
                 sentence = row[1].strip()
                 data_rows.append((description_id, sentence))
+    return data_rows
 
-    # Create mapping: custom_id -> list of (description_id, sentence) tuples
+
+def batch_mapping_from_jsonl(jsonl_path):
+    """Return mapping: custom_id -> list of description_ids (in order)"""
     mapping = {}
-    for i in range(0, len(data_rows), batch_size):
-        batch_data = data_rows[i:i + batch_size]
-        custom_id = f"batch-{i // batch_size + 1:04d}"
-        mapping[custom_id] = batch_data
-
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            custom_id = item.get("custom_id")
+            user_content = None
+            try:
+                user_content = [
+                    m for m in item["body"]["messages"] if m["role"] == "user"
+                ][0]["content"]
+            except Exception:
+                pass
+            if user_content:
+                # Extract description_ids from the user prompt
+                ids = []
+                for l in user_content.splitlines():
+                    m = re.match(r"^([^.]+)\. ", l)
+                    if m:
+                        ids.append(m.group(1))
+                mapping[custom_id] = ids
     return mapping
+
+
+def parse_output_jsonl(output_jsonl_path):
+    """Returns dict custom_id -> assistant content (raw string)."""
+    results = {}
+    with open(output_jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            cid = item.get("custom_id")
+            try:
+                content = item["response"]["body"]["choices"][0]["message"][
+                    "content"]
+            except Exception:
+                content = None
+            results[cid] = content
+    return results
+
+
+def split_translations_by_id(translated_blob):
+    """Given blob like 'desc_001. xxx\ndesc_002. yyy', returns dict description_id -> translation."""
+    if not translated_blob:
+        return {}
+    lines = [l.strip() for l in translated_blob.splitlines() if l.strip()]
+    translations = {}
+    for l in lines:
+        m = re.match(r"^([^.]+)\.\s*(.*)$", l)
+        if m:
+            description_id = m.group(1)
+            translation = m.group(2)
+            translations[description_id] = translation
+    return translations
+
+
+def is_suspicious_translation(text):
+    suspicious_tokens = {
+        "[TRANSLATION_FAILED]", "plaintext", "text", "code", "output", "none",
+        "null"
+    }
+    if not text or text.strip().lower() in suspicious_tokens:
+        return True
+    if text.strip().startswith("```") or text.strip().startswith("<"):
+        return True
+    # Heuristic: very short output (less than 5 chars, not a digit)
+    if len(text.strip()) < 5 and not text.strip().isdigit():
+        return True
+    return False
+
+
+def assemble_csv_with_detailed_errors(original_data, batch_mapping,
+                                      model_outputs, out_csv_path):
+    """Create final CSV with description_id, English, Translated columns. Report detailed errors and flag likely shifted or suspicious translations."""
+    print(f"[+] Assembling final CSV: {out_csv_path}")
+    with open(out_csv_path, "w", newline="", encoding="utf-8-sig") as csvf:
+        writer = csv.writer(csvf)
+        writer.writerow(
+            ["description_id", "english_sentence", "translated_sentence"])
+        all_failed = []
+        all_extra = []
+        all_success = 0
+        all_shifted = []
+        all_suspicious = []
+        for custom_id, description_ids in batch_mapping.items():
+            translated_blob = model_outputs.get(custom_id)
+            translations = split_translations_by_id(translated_blob)
+            missing = []
+            extra = []
+            batch_rows = []  # For shift detection
+            for description_id in description_ids:
+                english_sentence = next(
+                    (s for did, s in original_data if did == description_id),
+                    "")
+                translated_sentence = translations.get(description_id)
+                if translated_sentence is None:
+                    writer.writerow([
+                        description_id, english_sentence,
+                        "[TRANSLATION_FAILED]"
+                    ])
+                    missing.append((description_id, english_sentence))
+                    batch_rows.append((description_id, english_sentence,
+                                       "[TRANSLATION_FAILED]"))
+                else:
+                    writer.writerow([
+                        description_id, english_sentence, translated_sentence
+                    ])
+                    all_success += 1
+                    batch_rows.append((description_id, english_sentence,
+                                       translated_sentence))
+                    if is_suspicious_translation(translated_sentence):
+                        all_suspicious.append(
+                            (custom_id, description_id, english_sentence,
+                             translated_sentence))
+            # Find extra translations not in the batch
+            for tid in translations:
+                if tid not in description_ids:
+                    extra.append((tid, translations[tid]))
+            if missing:
+                print(f"[ERROR] Batch {custom_id}: Missing translations for:")
+                for did, eng in missing:
+                    print(f"  - {did}: {eng}")
+                all_failed.extend([(custom_id, did, eng)
+                                   for did, eng in missing])
+            if extra:
+                print(
+                    f"[WARNING] Batch {custom_id}: Extra translations returned:"
+                )
+                for tid, tval in extra:
+                    print(f"  - {tid}: {tval}")
+                all_extra.extend([(custom_id, tid, tval)
+                                  for tid, tval in extra])
+            # Shifted translation check
+            for i in range(len(batch_rows) - 1):
+                curr_id, curr_eng, curr_trans = batch_rows[i]
+                next_id, next_eng, next_trans = batch_rows[i + 1]
+                if (curr_trans == "[TRANSLATION_FAILED]"
+                        or is_suspicious_translation(curr_trans)
+                    ) and next_trans not in (
+                        "[TRANSLATION_FAILED]", None,
+                        "") and not is_suspicious_translation(next_trans):
+                    # If the next translation is not blank or suspicious, flag possible shift
+                    all_shifted.append(
+                        (custom_id, curr_id, curr_eng, next_id, next_trans))
+            # Check if last row is blank or suspicious
+            if batch_rows and (batch_rows[-1][2] == "[TRANSLATION_FAILED]"
+                               or is_suspicious_translation(
+                                   batch_rows[-1][2])) and len(batch_rows) > 1:
+                prev_id, prev_eng, prev_trans = batch_rows[-2]
+                if prev_trans not in (
+                        "[TRANSLATION_FAILED]", None,
+                        "") and not is_suspicious_translation(prev_trans):
+                    all_shifted.append(
+                        (custom_id, batch_rows[-1][0], batch_rows[-1][1],
+                         prev_id, prev_trans))
+        print(f"[SUMMARY] {all_success} successful translations written.")
+        if all_failed:
+            print(f"[SUMMARY] {len(all_failed)} missing translations:")
+            for custom_id, did, eng in all_failed:
+                print(f"  - Batch {custom_id}, {did}: {eng}")
+        if all_extra:
+            print(f"[SUMMARY] {len(all_extra)} extra translations returned:")
+            for custom_id, tid, tval in all_extra:
+                print(f"  - Batch {custom_id}, {tid}: {tval}")
+        if all_suspicious:
+            print(
+                f"[SUSPICIOUS] {len(all_suspicious)} suspicious translations detected:"
+            )
+            for custom_id, did, eng, trans in all_suspicious:
+                print(
+                    f"  - Batch {custom_id}, {did}: '{trans}' (English: '{eng[:40]}...')"
+                )
+        if all_shifted:
+            print(
+                f"[SHIFT WARNING] {len(all_shifted)} possible shifted translations detected:"
+            )
+            for custom_id, missing_id, missing_eng, shifted_from_id, shifted_trans in all_shifted:
+                print(
+                    f"  - Batch {custom_id}: Likely translation for {missing_id} ('{missing_eng[:40]}...') was output for {shifted_from_id}: '{shifted_trans[:40]}...'"
+                )
+        if not all_failed and not all_extra and not all_shifted and not all_suspicious:
+            print("[SUMMARY] All translations matched by description_id.")
 
 
 def check_job_status(job_id):
@@ -74,259 +253,6 @@ def download_file(file_id, dest_path):
     except Exception as e:
         print(f"Error downloading file: {e}")
         return False
-
-
-def parse_output_jsonl(output_jsonl_path):
-    """Returns dict custom_id -> assistant content (raw string)."""
-    results = {}
-    error_count = 0
-
-    with open(output_jsonl_path, encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line)
-                cid = item.get("custom_id")
-                print(f"[DEBUG] Processing line {line_num}, custom_id: {cid}")
-
-                # Check for actual errors - only if error field exists AND has meaningful content
-                if "error" in item and item["error"] is not None and item[
-                        "error"]:
-                    print(
-                        f"Error in line {line_num}, custom_id {cid}: {item['error']}"
-                    )
-                    results[cid] = None
-                    error_count += 1
-                    continue
-
-                # Check if response structure exists
-                if "response" not in item:
-                    print(
-                        f"No response field in line {line_num}, custom_id {cid}"
-                    )
-                    results[cid] = None
-                    error_count += 1
-                    continue
-
-                response = item["response"]
-
-                # Check if it's an HTTP error response
-                if "status_code" in response and response["status_code"] != 200:
-                    print(
-                        f"HTTP error in line {line_num}, custom_id {cid}: {response.get('status_code')}"
-                    )
-                    results[cid] = None
-                    error_count += 1
-                    continue
-
-                # Extract content from successful response
-                try:
-                    content = response["body"]["choices"][0]["message"][
-                        "content"]
-                    results[cid] = content
-                    print(
-                        f"[DEBUG] Extracted content for {cid}: {content[:100]}..."
-                    )
-                except KeyError as e:
-                    print(
-                        f"Error extracting content from line {line_num}, custom_id {cid}: Missing key {e}"
-                    )
-                    results[cid] = None
-                    error_count += 1
-                    continue
-
-            except Exception as e:
-                print(f"Error parsing line {line_num}: {e}")
-                error_count += 1
-                continue
-
-    print(f"Parsed {len(results)} results with {error_count} errors")
-    return results
-
-
-def split_translations_with_debug(translated_blob, custom_id):
-    """Enhanced version with detailed debugging."""
-    if not translated_blob:
-        print(f"[DEBUG] {custom_id}: Empty translation blob")
-        return []
-
-    print(f"\n[DEBUG] {custom_id}: Processing translation blob")
-    print(
-        f"[DEBUG] {custom_id}: Raw blob length: {len(translated_blob)} chars")
-    print(
-        f"[DEBUG] {custom_id}: First 200 chars: {repr(translated_blob[:200])}")
-
-    lines = [l.strip() for l in translated_blob.splitlines() if l.strip()]
-    print(f"[DEBUG] {custom_id}: Found {len(lines)} non-empty lines")
-
-    cleaned = []
-    for i, line in enumerate(lines):
-        print(f"[DEBUG] {custom_id}: Line {i+1}: {repr(line[:100])}")
-
-        # Check if line starts with a number
-        if line and line[0].isdigit():
-            import re
-            # Try to extract the number and check if it's sequential
-            match = re.match(r'^(\d+)\.\s*(.*)', line)
-            if match:
-                number = int(match.group(1))
-                translation = match.group(2)
-                print(
-                    f"[DEBUG] {custom_id}: Extracted number {number}: {repr(translation[:50])}"
-                )
-                cleaned.append(translation)
-            else:
-                print(
-                    f"[DEBUG] {custom_id}: Could not parse numbered line: {repr(line[:100])}"
-                )
-                # Try alternative patterns
-                cleaned_line = re.sub(r'^\d+\.\s*', '', line)
-                cleaned.append(cleaned_line)
-        else:
-            print(
-                f"[DEBUG] {custom_id}: Non-numbered line: {repr(line[:100])}")
-            cleaned.append(line)
-
-    print(f"[DEBUG] {custom_id}: Final cleaned translations: {len(cleaned)}")
-    return cleaned
-
-
-def assemble_csv_with_enhanced_debug(original_mapping, model_outputs,
-                                     out_csv_path):
-    """Enhanced version with detailed debugging for length mismatches."""
-    print(f"[+] Assembling final CSV: {out_csv_path}")
-    print(f"[+] Found {len(original_mapping)} batches in original mapping")
-    print(f"[+] Found {len(model_outputs)} results from model")
-
-    successful_translations = 0
-    failed_translations = 0
-    mismatch_batches = []
-
-    # Use UTF-8 encoding with BOM for better Excel compatibility
-    with open(out_csv_path, "w", newline="", encoding="utf-8-sig") as csvf:
-        writer = csv.writer(csvf)
-        writer.writerow(
-            ["description_id", "english_sentence", "telugu_sentence"])
-
-        for custom_id, data_list in original_mapping.items():
-            print(
-                f"\n[DEBUG] Processing {custom_id} with {len(data_list)} entries"
-            )
-
-            # Show first few English sentences for context
-            for i, (desc_id, eng_sentence) in enumerate(data_list[:3]):
-                print(
-                    f"[DEBUG] {custom_id}: English {i+1}: {desc_id} -> {eng_sentence[:60]}..."
-                )
-            if len(data_list) > 3:
-                print(
-                    f"[DEBUG] {custom_id}: ... and {len(data_list) - 3} more")
-
-            telugu_blob = model_outputs.get(custom_id)
-
-            if telugu_blob is None:
-                print(f"[WARNING] No translation found for {custom_id}")
-                # Missing translation: write with failure markers
-                for description_id, english_sentence in data_list:
-                    writer.writerow([
-                        description_id, english_sentence,
-                        "[TRANSLATION_FAILED]"
-                    ])
-                    failed_translations += 1
-                continue
-
-            print(f"[DEBUG] Found translation blob for {custom_id}")
-            telugu_list = split_translations_with_debug(telugu_blob, custom_id)
-
-            # Handle length mismatches with detailed analysis
-            if len(telugu_list) != len(data_list):
-                print(f"\n[ERROR] Length mismatch in {custom_id}!")
-                print(f"[ERROR] Expected: {len(data_list)} English sentences")
-                print(f"[ERROR] Got: {len(telugu_list)} Telugu translations")
-
-                mismatch_batches.append({
-                    'custom_id':
-                    custom_id,
-                    'expected':
-                    len(data_list),
-                    'got':
-                    len(telugu_list),
-                    'english_sentences': [eng for _, eng in data_list],
-                    'telugu_translations':
-                    telugu_list
-                })
-
-                # Save detailed debug file for this batch
-                debug_filename = f"debug_{custom_id}_mismatch.txt"
-                with open(debug_filename, 'w', encoding='utf-8') as debug_file:
-                    debug_file.write(f"MISMATCH ANALYSIS FOR {custom_id}\n")
-                    debug_file.write("=" * 50 + "\n\n")
-
-                    debug_file.write(
-                        f"Expected: {len(data_list)} translations\n")
-                    debug_file.write(
-                        f"Got: {len(telugu_list)} translations\n\n")
-
-                    debug_file.write("ENGLISH SENTENCES:\n")
-                    debug_file.write("-" * 30 + "\n")
-                    for i, (desc_id, eng_sentence) in enumerate(data_list, 1):
-                        debug_file.write(f"{i}. [{desc_id}] {eng_sentence}\n")
-
-                    debug_file.write(f"\nTELUGU TRANSLATIONS:\n")
-                    debug_file.write("-" * 30 + "\n")
-                    for i, tel_sentence in enumerate(telugu_list, 1):
-                        debug_file.write(f"{i}. {tel_sentence}\n")
-
-                    debug_file.write(f"\nRAW TRANSLATION BLOB:\n")
-                    debug_file.write("-" * 30 + "\n")
-                    debug_file.write(telugu_blob)
-
-                print(f"[DEBUG] Saved detailed analysis to: {debug_filename}")
-
-                # Show side-by-side comparison
-                print(f"\n[DEBUG] Side-by-side comparison for {custom_id}:")
-                max_len = max(len(data_list), len(telugu_list))
-                for i in range(max_len):
-                    eng_text = f"[{data_list[i][0]}] {data_list[i][1][:60]}..." if i < len(
-                        data_list) else "MISSING"
-                    tel_text = telugu_list[i][:60] + "..." if i < len(
-                        telugu_list) else "MISSING"
-
-                    status = "✓" if i < len(data_list) and i < len(
-                        telugu_list) else "✗"
-                    print(f"  {status} {i+1:3d}: ENG: {eng_text}")
-                    print(f"      {' '*3}  TEL: {tel_text}")
-
-            # Pair data with translations
-            for idx, (description_id,
-                      english_sentence) in enumerate(data_list):
-                telugu_sentence = telugu_list[idx] if idx < len(
-                    telugu_list) else "[INCOMPLETE_TRANSLATION]"
-                writer.writerow(
-                    [description_id, english_sentence, telugu_sentence])
-
-                if telugu_sentence and not telugu_sentence.startswith(
-                        "[") and telugu_sentence.strip():
-                    successful_translations += 1
-                else:
-                    failed_translations += 1
-
-    print(
-        f"\n[+] CSV written: {successful_translations} successful, {failed_translations} failed translations"
-    )
-
-    # Summary of mismatches
-    if mismatch_batches:
-        print(
-            f"\n[SUMMARY] Found {len(mismatch_batches)} batches with length mismatches:"
-        )
-        for batch in mismatch_batches:
-            print(
-                f"  - {batch['custom_id']}: expected {batch['expected']}, got {batch['got']}"
-            )
-    else:
-        print(f"\n[SUMMARY] No length mismatches found!")
 
 
 def analyze_existing_jsonl(jsonl_path):
@@ -401,10 +327,17 @@ def debug_specific_batch(custom_id,
     print(f"\n[DEBUG] Analyzing specific batch: {custom_id}")
 
     # Load original mapping
-    original_mapping = load_original_data(original_csv, batch_size)
+    original_data = load_original_data(original_csv)
 
-    if custom_id not in original_mapping:
-        print(f"[ERROR] Custom ID {custom_id} not found in original mapping")
+    # Load batch mapping from the JSONL used to create the batch
+    print(
+        "[INFO] Please provide the JSONL used to create the batch for accurate mapping."
+    )
+    batch_jsonl_path = input("Enter path to the batch JSONL file: ").strip()
+    batch_mapping = batch_mapping_from_jsonl(batch_jsonl_path)
+
+    if custom_id not in batch_mapping:
+        print(f"[ERROR] Custom ID {custom_id} not found in batch mapping")
         return
 
     # Load model outputs
@@ -415,17 +348,30 @@ def debug_specific_batch(custom_id,
         return
 
     # Analyze this specific batch
-    data_list = original_mapping[custom_id]
-    telugu_blob = model_outputs[custom_id]
+    description_ids = batch_mapping[custom_id]
+    missing_ids = []
+    extra_ids = []
+    for description_id in description_ids:
+        english_sentence = next(
+            (s for did, s in original_data if did == description_id), "")
+        translated_sentence = model_outputs[custom_id]
+        if translated_sentence is None:
+            missing_ids.append((description_id, english_sentence))
+        else:
+            translations = split_translations_by_id(translated_sentence)
+            if description_id not in translations:
+                extra_ids.append((description_id, english_sentence))
 
-    print(f"[DEBUG] English sentences: {len(data_list)}")
-    print(f"[DEBUG] Translation blob length: {len(telugu_blob)} chars")
+    print(f"[DEBUG] English sentences: {len(description_ids)}")
+    print(f"[DEBUG] Translation blob length: {len(translated_sentence)} chars")
 
-    telugu_list = split_translations_with_debug(telugu_blob, custom_id)
+    print(f"\n[DEBUG] Missing translations for {custom_id}:")
+    for did, eng in missing_ids:
+        print(f"  - {did}: {eng}")
 
-    print(f"\n[DEBUG] Final comparison:")
-    print(f"Expected: {len(data_list)}")
-    print(f"Got: {len(telugu_list)}")
+    print(f"\n[DEBUG] Extra translations for {custom_id}:")
+    for did, eng in extra_ids:
+        print(f"  - {did}: {eng}")
 
 
 # Replace the original functions in your code with these enhanced versions:
@@ -440,76 +386,28 @@ def debug_specific_batch(custom_id,
 
 def main():
     import sys
-
-    if len(sys.argv) < 2:
-        print("Usage:")
+    if len(sys.argv) < 4:
         print(
-            "  python check_and_process.py <job_id>                    # Check job status"
+            "Usage: python check_and_process.py <input_csv> <batch_output.jsonl> <output_csv>"
         )
         print(
-            "  python check_and_process.py <job_id> --process          # Check status and process if complete"
-        )
-        print(
-            "  python check_and_process.py --process-local             # Process existing batch_output.jsonl"
+            "Example: python check_and_process.py test_input.csv batch_output.jsonl translations.csv"
         )
         return
-
-    if sys.argv[1] == "--process-local":
-        # Process existing local files
-        if not Path("batch_output.jsonl").exists():
-            print("Error: batch_output.jsonl not found")
-            return
-
-        original_mapping = load_original_data(INPUT_CSV, BATCH_SIZE)
-        model_outputs = parse_output_jsonl("batch_output.jsonl")
-        # Add this line before assemble_csv call
-        analyze_existing_jsonl("batch_output.jsonl")
-        model_outputs = parse_output_jsonl("batch_output.jsonl")
-        assemble_csv_with_enhanced_debug(original_mapping, model_outputs, OUTPUT_CSV)  # Use enhanced version
-        print(f"[+] Done. Final translations in: {OUTPUT_CSV}")
-        return
-
-    job_id = sys.argv[1]
-    should_process = len(sys.argv) > 2 and sys.argv[2] == "--process"
-
-    # Check job status
-    job = check_job_status(job_id)
-    if not job:
-        return
-
-    if job.status == "completed":
-        print("[+] Job completed!")
-
-        if should_process:
-            # Download and process results
-            if download_file(job.output_file_id, "batch_output.jsonl"):
-
-                # Download errors if they exist
-                if hasattr(job, 'error_file_id') and job.error_file_id:
-                    download_file(job.error_file_id, "batch_errors.jsonl")
-                    print("[!] Some errors occurred. Check batch_errors.jsonl")
-
-                # Process results
-                original_mapping = load_original_data(INPUT_CSV, BATCH_SIZE)
-                model_outputs = parse_output_jsonl("batch_output.jsonl")
-                # Add this line before assemble_csv call
-                analyze_existing_jsonl("batch_output.jsonl")
-                model_outputs = parse_output_jsonl("batch_output.jsonl")
-                assemble_csv_with_enhanced_debug(original_mapping, model_outputs, OUTPUT_CSV)  # Use enhanced version
-                print(f"[+] Done. Final translations in: {OUTPUT_CSV}")
-            else:
-                print("Failed to download results")
-        else:
-            print("Add --process flag to download and process results")
-
-    elif job.status == "failed":
-        print("[!] Job failed!")
-        if hasattr(job, 'error_file_id') and job.error_file_id:
-            download_file(job.error_id, "batch_errors.jsonl")
-            print("Check batch_errors.jsonl for details")
-
-    else:
-        print(f"Job still {job.status}. Check again later.")
+    input_csv = sys.argv[1]
+    batch_output_jsonl = sys.argv[2]
+    output_csv = sys.argv[3]
+    original_data = load_original_data(input_csv)
+    # Load batch mapping from the JSONL used to create the batch
+    print(
+        "[INFO] Please provide the JSONL used to create the batch for accurate mapping."
+    )
+    batch_jsonl_path = input("Enter path to the batch JSONL file: ").strip()
+    batch_mapping = batch_mapping_from_jsonl(batch_jsonl_path)
+    model_outputs = parse_output_jsonl(batch_output_jsonl)
+    assemble_csv_with_detailed_errors(original_data, batch_mapping,
+                                      model_outputs, output_csv)
+    print(f"[+] Done. Final translations in: {output_csv}")
 
 
 if __name__ == "__main__":

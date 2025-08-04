@@ -80,3 +80,23 @@ coverage.xml
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+#test files
+test_input.csv
+test_output.jsonl
+test_folder/    
+output_folder/
+translations.csv
+batch_output.jsonl
+batch_errors.jsonl
+batch_requests_backup.jsonl
+debug_*.txt
+translations_backup.csv
+test_input_2_1754307203_batch.jsonl
+test_input_2_1754307203_output.jsonl
+test_input_2_1754307203_errors.jsonl
+test_input_1754307203_batch.jsonl
+test_input_1754307203_output.jsonl
+
+GITHUB_SETUP.md
+BRANCHING_STRATEGY.md
