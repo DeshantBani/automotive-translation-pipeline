@@ -10,6 +10,7 @@ import time
 import json
 import csv
 import re
+import tiktoken
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -26,26 +27,30 @@ if not os.getenv("OPENAI_API_KEY"):
 
 # Configuration
 MODEL_NAME = "gpt-4o"
-MODEL_TOKEN_LIMIT = 16000
-EXPECTED_OUTPUT_FACTOR = 1.2
+MODEL_TOKEN_LIMIT = 8000  # Reduced from 16000 for smaller batches
+EXPECTED_OUTPUT_FACTOR = 1.2  # Increased to account for tuple format
 POLL_INTERVAL = 300  # 5 minutes
 
 
 def get_system_prompt(target_language):
-    return f"""You are an expert automotive translator proficient in English and {target_language}. Your task is to translate technical automotive sentences from English into accurate, formal {target_language}. Ensure technical automotive terminology is translated precisely. If a specific automotive technical term, diagnostic code, or component name doesn't have an exact {target_language} equivalent, retain it in English or transliterate it clearly into {target_language} script.
+    return f"""You are an expert automotive translator proficient in English and {target_language}. Your task is to translate technical automotive sentences from English into accurate, formal {target_language}.
 
-- Preserve numeric codes, such as fault codes (e.g., P0089), as-is.
-- The sentences provided by the user are identified by their unique description_id. Provide translations in {target_language} strictly following the exact description_id and sequence of the input sentences. Do not alter the sequence under any circumstance.
-- Only output translated sentences in {target_language} with the respective description_id. Do NOT include explanations or additional text.
+CRITICAL INSTRUCTIONS:
+1. You will receive a JSON object where each key is a description_id and each value is an English sentence
+2. You MUST return a JSON object with the EXACT same keys (description_ids) mapped to their {target_language} translations
+3. Preserve the exact description_id mapping - do not change, reorder, or skip any IDs
+4. Ensure technical automotive terminology is translated precisely
+5. If a technical term doesn't have an exact {target_language} equivalent, retain it in English or transliterate it clearly
+6. Preserve numeric codes (e.g., P0089) as-is
+
+INPUT FORMAT: {{"id1": "sentence1", "id2": "sentence2", ...}}
+OUTPUT FORMAT: {{"id1": "translation1", "id2": "translation2", ...}}
 
 Example:
-Input:
-desc_001. The fault code P0089 indicates that there is an issue with the performance of the fuel pressure regulator 1.
-desc_002. Engine misfire can occur due to issues with the ignition coils or spark plugs.
+Input: {{"21": "Low fuel pressure detected", "27": "Engine misfire detected"}}
+Output: {{"21": "<{target_language} translation>", "27": "<{target_language} translation>"}}
 
-Expected Output:
-desc_001. <translation>
-desc_002. <translation>"""
+IMPORTANT: Return ONLY the JSON object with translations. No explanations, no additional text."""
 
 
 def count_tokens(text, encoding):
@@ -53,7 +58,7 @@ def count_tokens(text, encoding):
 
 
 def create_jsonl_from_csv(csv_filename, jsonl_filename, target_language):
-    """Create JSONL file from CSV with description_id support and dynamic batching based on token count."""
+    """Create JSONL file from CSV with smaller batches and JSON format for better mapping."""
     encoding = tiktoken.encoding_for_model(MODEL_NAME)
 
     with open(csv_filename, 'r', encoding='utf-8') as csv_file:
@@ -73,9 +78,11 @@ def create_jsonl_from_csv(csv_filename, jsonl_filename, target_language):
     current_batch = []
     current_tokens = system_prompt_tokens
 
-    for (description_id, sentence) in enumerate(data_rows):
-        line = f"{description_id}. {sentence}"
-        line_tokens = count_tokens(line + "\n", encoding)
+    for (description_id, sentence) in data_rows:
+        # Create JSON format: {"id": "sentence"}
+        json_entry = {description_id: sentence}
+        json_str = json.dumps(json_entry, ensure_ascii=False)
+        line_tokens = count_tokens(json_str, encoding)
         est_output_tokens = int(line_tokens * EXPECTED_OUTPUT_FACTOR)
         total_if_added = current_tokens + line_tokens + est_output_tokens
 
@@ -92,10 +99,10 @@ def create_jsonl_from_csv(csv_filename, jsonl_filename, target_language):
 
     with open(jsonl_filename, 'w', encoding='utf-8') as jsonl_file:
         for batch_num, batch_data in enumerate(batches, 1):
-            id_sentences = "\n".join([
-                f"{description_id}. {sentence}"
-                for description_id, sentence in batch_data
-            ])
+            # Create JSON object for the batch
+            batch_json = {}
+            for description_id, sentence in batch_data:
+                batch_json[description_id] = sentence
 
             json_entry = {
                 "custom_id": f"batch-{batch_num:04d}",
@@ -108,8 +115,10 @@ def create_jsonl_from_csv(csv_filename, jsonl_filename, target_language):
                         "role": "system",
                         "content": system_prompt
                     }, {
-                        "role": "user",
-                        "content": id_sentences
+                        "role":
+                        "user",
+                        "content":
+                        json.dumps(batch_json, ensure_ascii=False)
                     }],
                     "temperature":
                     0,
@@ -121,6 +130,9 @@ def create_jsonl_from_csv(csv_filename, jsonl_filename, target_language):
 
     print(
         f"Created JSONL file with {len(data_rows)} sentences across {len(batches)} batches"
+    )
+    print(
+        f"Average batch size: {len(data_rows)/len(batches):.1f} sentences per batch"
     )
     return batches
 
@@ -193,32 +205,119 @@ def parse_output_jsonl(output_jsonl_path):
 
 
 def split_translations_by_id(translated_blob):
-    """Extract translations by description_id."""
+    """Extract translations by description_id from JSON format."""
     if not translated_blob:
         return {}
-    lines = [l.strip() for l in translated_blob.splitlines() if l.strip()]
+
     translations = {}
+
+    try:
+        # Clean the blob to extract JSON from markdown code blocks
+        cleaned_blob = translated_blob.strip()
+
+        # Remove markdown code block markers
+        if cleaned_blob.startswith('```json'):
+            cleaned_blob = cleaned_blob[7:]  # Remove ```json
+        elif cleaned_blob.startswith('```'):
+            cleaned_blob = cleaned_blob[3:]  # Remove ```
+
+        if cleaned_blob.endswith('```'):
+            cleaned_blob = cleaned_blob[:-3]  # Remove closing ```
+
+        cleaned_blob = cleaned_blob.strip()
+
+        # First try to parse as JSON (new format)
+        json_data = json.loads(cleaned_blob)
+        if isinstance(json_data, dict):
+            # Direct JSON mapping - this is what we want
+            for desc_id, translation in json_data.items():
+                if translation and str(translation).strip():
+                    translations[str(desc_id)] = str(translation).strip()
+            return translations
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error for batch response: {e}")
+        print(f"First 200 chars of response: {translated_blob[:200]}...")
+        # If JSON parsing fails, fall back to line-by-line parsing
+        pass
+
+    # Fallback: Parse line by line (for backward compatibility)
+    lines = [l.strip() for l in translated_blob.splitlines() if l.strip()]
+
     for l in lines:
-        m = re.match(r"^([^.]+)\.\s*(.*)$", l)
-        if m:
-            description_id = m.group(1)
-            translation = m.group(2)
-            translations[description_id] = translation
+        # Skip code blocks and other non-translation content
+        if l.startswith('```') or l.startswith('<') or l in [
+                'plaintext', 'json', 'text'
+        ]:
+            continue
+
+        # Try multiple patterns to handle different output formats
+        patterns = [
+            # Pattern 1: JSON-like "id": "translation"
+            r'^"?(\d+)"?\s*:\s*"(.+?)"$',
+            # Pattern 2: "277. ('597', 'translation')" - tuple format (handle first)
+            r"^(\d+)\.\s*\(\'(\d+)\',\s*\'(.+?)\'\)$",
+            # Pattern 3: "desc_021. translation" or "21. translation"
+            r"^(?:desc_)?(\d+)\.\s*(.*)$",
+            # Pattern 4: Generic "key. value" format
+            r"^([^.]+)\.\s*(.*)$"
+        ]
+
+        matched = False
+        for pattern in patterns:
+            m = re.match(pattern, l)
+            if m:
+                if len(m.groups()) == 2:
+                    # Standard format
+                    description_id = m.group(1)
+                    translation = m.group(2)
+                elif len(m.groups()) == 3:
+                    # Tuple format: use the ID from inside the tuple
+                    description_id = m.group(2)
+                    translation = m.group(3)
+
+                # Clean up description_id (remove 'desc_' prefix if present)
+                if description_id.startswith('desc_'):
+                    description_id = description_id[5:]
+
+                # Clean up translation (remove quotes if present)
+                translation = translation.strip().strip('"').strip("'")
+
+                # Only add if translation is not empty and not suspicious
+                if translation and not is_suspicious_translation(translation):
+                    translations[description_id] = translation
+                matched = True
+                break
+
+        # Debug: print unmatched lines for troubleshooting
+        if not matched and l and len(translations) < 10:
+            print(f"Warning: Could not parse line: {l[:100]}...")
+
     return translations
 
 
 def is_suspicious_translation(text):
     """Check if translation is suspicious."""
+    if not text or not isinstance(text, str):
+        return True
+
+    text_lower = text.strip().lower()
     suspicious_tokens = {
-        "[TRANSLATION_FAILED]", "plaintext", "text", "code", "output", "none",
-        "null"
+        "[translation_failed]", "plaintext", "text", "code", "output", "none",
+        "null", "undefined", "error", "failed", "missing", "empty", "json",
+        "translation", "response", "content", "message", "system", "user"
     }
-    if not text or text.strip().lower() in suspicious_tokens:
+
+    if text_lower in suspicious_tokens:
         return True
     if text.strip().startswith("```") or text.strip().startswith("<"):
         return True
-    if len(text.strip()) < 5 and not text.strip().isdigit():
+    if text.strip().startswith("{") or text.strip().startswith("["):
         return True
+    if len(text.strip()) < 3:  # Very short translations are suspicious
+        return True
+    if text.strip().isdigit():  # Pure numbers are suspicious
+        return True
+
     return False
 
 
@@ -239,6 +338,7 @@ def process_results(input_csv, output_jsonl, final_csv, batches):
 
     # Parse model outputs
     model_outputs = parse_output_jsonl(output_jsonl)
+    print(f"Found {len(model_outputs)} batch responses")
 
     # Create batch mapping
     batch_mapping = {}
@@ -260,8 +360,10 @@ def process_results(input_csv, output_jsonl, final_csv, batches):
         all_suspicious = []
 
         for custom_id, description_ids in batch_mapping.items():
+            print(f"Processing {custom_id}...")
             translated_blob = model_outputs.get(custom_id)
             translations = split_translations_by_id(translated_blob)
+            print(f"  Extracted {len(translations)} translations")
             missing = []
             extra = []
             batch_rows = []
@@ -338,6 +440,15 @@ def process_results(input_csv, output_jsonl, final_csv, batches):
                                   for tid, tval in extra])
 
     # Print summary
+    total_processed = len(original_data)
+    print(f"\n=== TRANSLATION RESULTS ===")
+    print(f"Successful translations: {all_success}")
+    print(f"Failed translations: {len(all_failed)}")
+    print(f"Total processed: {total_processed}")
+    if total_processed > 0:
+        print(f"Success rate: {all_success/total_processed*100:.1f}%")
+    print(f"Final output: {final_csv}")
+
     print(
         f"\n[SUMMARY] {all_success} successful translations written to {final_csv}"
     )
@@ -370,8 +481,22 @@ def process_results(input_csv, output_jsonl, final_csv, batches):
                 f"  - Batch {custom_id}: Likely translation for {missing_id} ('{missing_eng[:40]}...') was output for {shifted_from_id}: '{shifted_trans[:40]}...'"
             )
 
+    # Final status message
     if not all_failed and not all_extra and not all_shifted and not all_suspicious:
+        print(
+            f"\n🎉 SUCCESS: All {all_success} translations completed perfectly!"
+        )
         print("[SUMMARY] All translations matched by description_id.")
+    else:
+        print(
+            f"\n⚠️  COMPLETED WITH ISSUES: {all_success} successful, {len(all_failed)} failed"
+        )
+        if all_extra:
+            print(f"   - {len(all_extra)} extra translations")
+        if all_shifted:
+            print(f"   - {len(all_shifted)} shifted translations")
+        if all_suspicious:
+            print(f"   - {len(all_suspicious)} suspicious translations")
 
 
 def main():

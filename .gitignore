@@ -65,17 +65,6 @@ temp/
 logs/
 .pytest_cache/
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints
-
-# Coverage reports
-htmlcov/
-.coverage
-.coverage.*
-coverage.xml
-*.cover
-.hypothesis/
-
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -92,11 +81,13 @@ batch_errors.jsonl
 batch_requests_backup.jsonl
 debug_*.txt
 translations_backup.csv
-test_input_2_1754307203_batch.jsonl
-test_input_2_1754307203_output.jsonl
-test_input_2_1754307203_errors.jsonl
-test_input_1754307203_batch.jsonl
-test_input_1754307203_output.jsonl
-
 GITHUB_SETUP.md
 BRANCHING_STRATEGY.md
+
+input_folder/
+translation_folder/
+filtered_file.csv
+merged_data.csv
+
+jsonl/
+batch_job_tracking.csv
