@@ -1,0 +1,8 @@
+﻿description_id,english_sentence,translated_sentence
+21,Low fuel pressure detected at the fuel delivery pressure sensor,ఫ్యూయల్ డెలివరీ ప్రెజర్ సెన్సార్ వద్ద తక్కువ ఇంధన పీడనం గుర్తించబడింది
+27,A performance fault with the Intake Air Temperature (IAT) sensor detected,ఇంటేక్ ఎయిర్ టెంపరేచర్ (IAT) సెన్సార్‌లో పనితీరు లోపం గుర్తించబడింది
+111,A number of high resolution pulses missing per every 8 cam reference pulses,ప్రతి 8 క్యామ్ రిఫరెన్స్ పల్స్‌లకు అనేక హై రిజల్యూషన్ పల్స్‌లు మిస్సింగ్
+323,Speed Wheel Sensor All Coherency Failure,స్పీడ్ వీల్ సెన్సార్ అన్ని సమన్వయ వైఫల్యం
+838,Longitudinal Acceleration Threshold Exceeded,లాంగిట్యూడినల్ యాక్సిలరేషన్ థ్రెషోల్డ్ మించిపోయింది
+965,Ignition Run/Act Circuit Open,ఇగ్నిషన్ రన్/యాక్ట్ సర్క్యూట్ ఓపెన్
+966,Ignition Run/Act Circuit Short To Battery,ఇగ్నిషన్ రన్/యాక్ట్ సర్క్యూట్ బ్యాటరీకి షార్ట్
