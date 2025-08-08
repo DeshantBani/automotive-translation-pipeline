@@ -51,18 +51,45 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Translation project specific files
-batch_output.jsonl
-batch_errors.jsonl
-batch_requests_backup.jsonl
+# Translation project specific files - Generated outputs
+output_folder/
+translation_folder/
+input_folder/
+jsonl/
+batch_job_tracking.csv
+
+# Generated log files and analysis
+logs/
+*.log
+missing_translations_*.log
+error_analysis_*.log
+translation_log_*.txt
+
+# Temporary batch files
+*_batch.jsonl
+*_output.jsonl
+*_errors.jsonl
+*_repaired.jsonl
+
+# Large data files
+sorted_filtered.csv
+final_translated_output.csv
+corrected_translated_output.csv
+output_test.csv
+
+# Test and debugging files
+test_input.csv
+test_output.jsonl
+test_folder/
 debug_*.txt
 translations_backup.csv
+filtered_file.csv
+merged_data.csv
 
-# Temporary and log files
-*.log
+
+# Temporary and cache files
 *.tmp
 temp/
-logs/
 .pytest_cache/
 
 # mypy
@@ -70,25 +97,6 @@ logs/
 .dmypy.json
 dmypy.json
 
-#test files
-test_input.csv
-test_output.jsonl
-test_folder/    
-output_folder/
-translations.csv
-batch_output.jsonl
-batch_errors.jsonl
-batch_requests_backup.jsonl
-debug_*.txt
-translations_backup.csv
+# Documentation that should not be in repo (optional)
 GITHUB_SETUP.md
 BRANCHING_STRATEGY.md
-
-input_folder/
-translation_folder/
-filtered_file.csv
-merged_data.csv
-
-jsonl/
-batch_job_tracking.csv
-testing/
